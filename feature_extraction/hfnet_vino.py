@@ -87,13 +87,10 @@ class FeatureNet:
         self.input_blob = next(iter(self.net.inputs))
         self.out_blob = next(iter(self.net.outputs))
         self.net.batch_size = 1
-	
         self.cur_request_id = 0
-        self.next_request_id = 1
-		
-        # set device_name and number of requests =2 
-        self.exec_net = self.ie.load_network(network=self.net, num_requests=2, device_name="CPU")
-
+        self.next_request_id = 3
+       
+        self.exec_net = self.ie.load_network(network=self.net, num_requests=4, device_name="CPU")
 
 
     def simple_nms(self, scores, iterations, radius):
@@ -151,51 +148,25 @@ class FeatureNet:
   #1 sync
         #res = self.exec_net.infer(inputs={self.input_blob: np.expand_dims(image_scaled, axis=0)})
   #2 async 
+        #res = self.request_wrap.execute("async", {self.input_blob: np.expand_dims(image_scaled, axis=0)})
+        #log.info("Processing output blob")
+        #res = self.infer_request.outputs[self.out_blob]
 
         self.exec_net.start_async(request_id=self.request_id, inputs={self.input_blob: np.expand_dims(image_scaled, axis=0)})
-
+        
         self.exec_net.requests[self.cur_request_id].wait(-1)
 
         res = self.exec_net.requests[self.cur_request_id].outputs
 
-        features = {}
-        # 1. Keypoints
-        scores = self.find_first_available(res, [
-            'pred/simple_nms/Select',
-            'pred/local_head/detector/Squeeze'])
 
-        if self.config['keypoint_number'] == 0 and self.config['nms_iterations'] == 0:
-            keypoints, features['scores'] = self.select_keypoints_threshold(scores,
-                    self.config['keypoint_threshold'], scale)
-        else:
-            keypoints, features['scores'] = self.select_keypoints(scores,
-                    self.config['keypoint_number'], self.config['keypoint_threshold'],
-                    self.config['nms_iterations'], self.config['nms_radius'])
-        # scaling back
-        features['keypoints'] = np.array([[int(i[0] * scale[0]), int(i[1] * scale[1])] for i in keypoints])
-
-        # 2. Local descriptors
-        if len(features['keypoints']) > 0:
-            local = self.find_first_available(res, [
-                'pred/local_head/descriptor/Conv_1/BiasAdd/Normalize',
-                'pred/local_head/descriptor/l2_normalize'])
-            local = np.transpose(local, (0,2,3,1))
-            features['local_descriptors'] = \
-                    tf.nn.l2_normalize(
-                        tf.contrib.resampler.resampler(
-                            local,
-                            tf.to_float(self.scaling_desc)[::-1]*tf.to_float(keypoints[None])),
-                        -1).numpy()
-        else:
-            features['local_descriptors'] = np.array([[]])
-
-        # 3. Global descriptor
-        features['global_descriptor'] = self.find_first_available(res, [
-            'pred/global_head/l2_normalize_1',
-            'pred/global_head/dimensionality_reduction/BiasAdd/Normalize'])
         
-        self.cur_request_id, self.next_request_id = self.next_request_id, self.cur_request_id
-        return features
+        self.cur_request_id = self.cur_request_id + 1
+        self.next_request_id = self.next_request_id + 1
+        if self.cur_request_id ==4:
+            self.cur_request_id = 0
+        if self.next_request_id==4:
+            self.next_request_id = 0
+        return res,self.config, scale,self.scaling_desc
 
     @staticmethod
     def find_first_available(dic, keys):

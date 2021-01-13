@@ -3,6 +3,7 @@ import os
 import cv2
 import numpy as np
 import time
+import tensorflow as tf
 import rospy
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
@@ -154,7 +155,47 @@ class Node():
             image = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
             image_gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         start = time.time()
-        features = self.net.infer(image_gray)
+        res , config, scale, scaling_desc= self.net.infer(image_gray)
+        features = {}
+
+        # 1. Keypoints
+        scores = self.find_first_available(res, ['pred/simple_nms/Select','pred/local_head/detector/Squeeze'])
+
+        if config['keypoint_number'] == 0 and config['nms_iterations'] == 0:
+            keypoints, features['scores'] = self.select_keypoints_threshold(scores,
+                    config['keypoint_threshold'], scale)
+        else:
+            keypoints, features['scores'] = self.select_keypoints(scores,
+                    config['keypoint_number'], config['keypoint_threshold'],
+                    config['nms_iterations'], config['nms_radius'])
+        # scaling back
+        features['keypoints'] = np.array([[int(i[0] * scale[0]), int(i[1] * scale[1])] for i in keypoints])
+
+        # 2. Local descriptors
+        if len(features['keypoints']) > 0:
+            local = self.find_first_available(res, [
+                'pred/local_head/descriptor/Conv_1/BiasAdd/Normalize',
+                'pred/local_head/descriptor/l2_normalize'])
+            local = np.transpose(local, (0,2,3,1))
+            features['local_descriptors'] = \
+                    tf.nn.l2_normalize(
+                        tf.contrib.resampler.resampler(
+                            local,
+                            tf.to_float(scaling_desc)[::-1]*tf.to_float(keypoints[None])),
+                        -1).numpy()
+        else:
+            features['local_descriptors'] = np.array([[]])
+
+        # 3. Global descriptor
+        features['global_descriptor'] = self.find_first_available(res, [
+            'pred/global_head/l2_normalize_1',
+            'pred/global_head/dimensionality_reduction/BiasAdd/Normalize'])
+
+
+
+
+
+
         stop = time.time()
         rospy.logdebug(topic + ': %.2f (%d keypoints)' % (
                 (stop - start) * 1000,
@@ -162,6 +203,53 @@ class Node():
         if (features['keypoints'].shape[0] != 0):
             res = {'features': features, 'header': msg.header, 'topic': topic, 'image': image}
             self.result_queue.put(res)
+
+
+    def find_first_available(self, dic, keys):
+        for key in keys:
+            if key in dic: return dic[key]
+        print('Could not find any of these keys:%s\nAvailable keys are:%s' % (
+                ''.join(['\n\t' + key for key in keys]),
+                ''.join(['\n\t' + key for key in dic.keys()])))
+        raise KeyError('Given keys are not available. See the log above.')
+
+    def select_keypoints(self, scores, keypoint_number, keypoint_threshold, nms_iterations, nms_radius):
+        scores = self.simple_nms(scores, nms_iterations, nms_radius)
+        keypoints = tf.where(tf.greater_equal(
+            scores[0], keypoint_threshold))
+        scores = tf.gather_nd(scores[0], keypoints)
+        k = tf.constant(keypoint_number, name='k')
+        k = tf.minimum(tf.shape(scores)[0], k)
+        scores, indices = tf.nn.top_k(scores, k)
+        keypoints = tf.to_int32(tf.gather(
+            tf.to_float(keypoints), indices))
+        return np.array(keypoints)[..., ::-1], np.array(scores)
+
+    def simple_nms(self, scores, iterations, radius):
+        """Performs non maximum suppression (NMS) on the heatmap using max-pooling.
+        This method does not suppress contiguous points that have the same score.
+        It is an approximate of the standard NMS and uses iterative propagation.
+        Arguments:
+            scores: the score heatmap, with shape `[B, H, W]`.
+            size: an interger scalar, the radius of the NMS window.
+        """
+        if iterations < 1: return scores
+        radius = tf.constant(radius, name='radius')
+        size = radius*2 + 1
+
+        max_pool = lambda x: gen_nn_ops.max_pool_v2(  # supports dynamic ksize
+                x[..., None], ksize=[1, size, size, 1],
+                strides=[1, 1, 1, 1], padding='SAME')[..., 0]
+        zeros = tf.zeros_like(scores)
+        max_mask = tf.equal(scores, max_pool(scores))
+        for _ in range(iterations-1):
+            supp_mask = tf.cast(max_pool(tf.to_float(max_mask)), tf.bool)
+            supp_scores = tf.where(supp_mask, zeros, scores)
+            new_max_mask = tf.equal(supp_scores, max_pool(supp_scores))
+            max_mask = max_mask | (new_max_mask & tf.logical_not(supp_mask))
+        return tf.where(max_mask, scores, zeros)
+
+
 
 def draw_keypoints(image, keypoints, scores):
     upper_score = 0.5
